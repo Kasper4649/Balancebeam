@@ -3,8 +3,11 @@ mod response;
 
 use clap::Parser;
 use rand::{Rng, SeedableRng};
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::{net::TcpListener, net::TcpStream, stream::StreamExt, sync::RwLock, time};
+use tokio::time;
+use tokio::{net::TcpListener, net::TcpStream, stream::StreamExt, sync::RwLock};
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -46,18 +49,18 @@ struct CmdOptions {
 /// You should add fields to this struct in later milestones.
 struct ProxyState {
     /// How frequently we check whether upstream servers are alive (Milestone 4)
-    #[allow(dead_code)]
     active_health_check_interval: usize,
     /// Where we should send requests when doing active health checks (Milestone 4)
-    #[allow(dead_code)]
     active_health_check_path: String,
     /// Maximum number of requests an individual IP can make in a minute (Milestone 5)
-    #[allow(dead_code)]
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
     /// The status of the upstream servers, true for up, false for down
     upstream_address_status: (Vec<bool>, usize),
+    /// The number of requests we've received since the last time we checked the upstream servers
+    upstream_address_request_counters: HashMap<String, usize>,
+    last_rate_limiting_check_time: time::Instant,
 }
 
 #[tokio::main]
@@ -96,6 +99,8 @@ async fn main() {
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
         upstream_address_status: (vec![true; upstream_len], upstream_len),
+        upstream_address_request_counters: HashMap::new(),
+        last_rate_limiting_check_time: time::Instant::now(),
     }));
 
     let state_ref = state.clone();
@@ -105,7 +110,19 @@ async fn main() {
 
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await {
-        if let Ok(stream) = stream {
+        if let Ok(mut stream) = stream {
+            if state.read().await.max_requests_per_minute > 0 {
+                if let Err(_) =
+                    rate_limiting_fixed_window(&state, &stream.peer_addr().unwrap().ip()).await
+                {
+                    let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+                    response::write_to_stream(&response, &mut stream)
+                        .await
+                        .unwrap();
+                    continue;
+                }
+            }
+
             // Handle the connection!
             let state_ref = state.clone();
             tokio::spawn(async move {
@@ -362,6 +379,43 @@ async fn active_health_check(state: Arc<RwLock<ProxyState>>) {
                     }
                 }
             };
+        }
+    }
+}
+
+async fn rate_limiting_fixed_window(
+    state: &Arc<RwLock<ProxyState>>,
+    client_ip: &IpAddr,
+) -> Result<(), std::io::Error> {
+    let max_requests = state.read().await.max_requests_per_minute;
+    {
+        let s = state.read().await;
+        if s.last_rate_limiting_check_time.elapsed() >= time::Duration::from_secs(60) {
+            // clear all requests counter
+            drop(s);
+            {
+                let mut s = state.write().await;
+                for (_, value) in s.upstream_address_request_counters.iter_mut() {
+                    *value = 0;
+                }
+                s.last_rate_limiting_check_time = time::Instant::now();
+            }
+        }
+    }
+    {
+        let mut s = state.write().await;
+        let times = s
+            .upstream_address_request_counters
+            .entry(client_ip.to_string())
+            .or_insert(0);
+        *times += 1;
+        if *times > max_requests {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Too many requests",
+            ))
+        } else {
+            Ok(())
         }
     }
 }
