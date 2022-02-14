@@ -4,7 +4,7 @@ mod response;
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use std::sync::Arc;
-use tokio::{net::TcpListener, net::TcpStream, stream::StreamExt, sync::RwLock};
+use tokio::{net::TcpListener, net::TcpStream, stream::StreamExt, sync::RwLock, time};
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -97,6 +97,12 @@ async fn main() {
         max_requests_per_minute: options.max_requests_per_minute,
         upstream_address_status: (vec![true; upstream_len], upstream_len),
     }));
+
+    let state_ref = state.clone();
+    tokio::spawn(async move {
+        active_health_check(state_ref).await;
+    });
+
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await {
         if let Ok(stream) = stream {
@@ -239,5 +245,123 @@ async fn handle_connection(mut client_conn: TcpStream, state: Arc<RwLock<ProxySt
         // Forward the response to the client
         send_response(&mut client_conn, &response).await;
         log::debug!("Forwarded response to client");
+    }
+}
+
+async fn active_health_check(state: Arc<RwLock<ProxyState>>) {
+    let s = state.read().await;
+    log::debug!("{}", s.active_health_check_interval);
+
+    let mut interval = time::interval(time::Duration::from_secs(
+        s.active_health_check_interval as u64,
+    ));
+    let len = s.upstream_addresses.len();
+    drop(s);
+
+    // The first interval ticks immediately
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+        for upstream_idx in 0..len {
+            let s = state.read().await;
+            let upstream_ip = &s.upstream_addresses[upstream_idx];
+            let request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(&s.active_health_check_path)
+                .header("Host", upstream_ip)
+                .body(Vec::new())
+                .unwrap();
+
+            let mut upstream_conn = if let Ok(stream) = TcpStream::connect(upstream_ip).await {
+                stream
+            } else {
+                drop(s);
+                {
+                    let s = state.read().await;
+                    if !s.upstream_address_status.0[upstream_idx] {
+                        continue;
+                    }
+                }
+                {
+                    let mut s = state.write().await;
+                    s.upstream_address_status.0[upstream_idx] = false;
+                    s.upstream_address_status.1 -= 1;
+                }
+                continue;
+            };
+            drop(s);
+
+            if let Err(_) = request::write_to_stream(&request, &mut upstream_conn).await {
+                log::error!("write to stream failed");
+                continue;
+            }
+
+            match response::read_from_stream(&mut upstream_conn, request.method()).await {
+                Ok(response) => {
+                    if response.status() == http::StatusCode::OK {
+                        {
+                            if state.read().await.upstream_address_status.0[upstream_idx] {
+                                continue;
+                            }
+                        }
+                        {
+                            let mut s = state.write().await;
+                            s.upstream_address_status.0[upstream_idx] = true;
+                            s.upstream_address_status.1 += 1;
+                        }
+                        {
+                            log::debug!(
+                                "Active check server {} ok, valid_num: {}",
+                                upstream_idx,
+                                state.read().await.upstream_address_status.1
+                            );
+                        }
+                    } else {
+                        log::debug!(
+                            "status_code: {}, {}",
+                            response.status().as_u16(),
+                            upstream_idx
+                        );
+                        {
+                            if !state.read().await.upstream_address_status.0[upstream_idx] {
+                                continue;
+                            }
+                        }
+                        {
+                            let mut s = state.write().await;
+                            s.upstream_address_status.0[upstream_idx] = false;
+                            s.upstream_address_status.1 -= 1;
+                        }
+                        {
+                            log::debug!(
+                                "Active check server {} failed, valid_num: {}",
+                                upstream_idx,
+                                state.read().await.upstream_address_status.1
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    log::error!(
+                        "Active health check upstream server {} is failed",
+                        upstream_idx
+                    );
+                    {
+                        {
+                            let s = state.read().await;
+                            if !s.upstream_address_status.0[upstream_idx] {
+                                continue;
+                            }
+                        }
+                        {
+                            let mut s = state.write().await;
+                            s.upstream_address_status.0[upstream_idx] = false;
+                            s.upstream_address_status.1 -= 1;
+                        }
+                    }
+                }
+            };
+        }
     }
 }
